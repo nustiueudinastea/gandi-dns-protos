@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"strings"
 	"time"
 
@@ -21,7 +22,10 @@ var gclient *gandi.Gandi
 // Gandi methods
 //
 
-func compareRecords(protosRecord gandi.ZoneRecord, gandiRecord gandi.ZoneRecord) bool {
+func compareRecords(precord gandi.ZoneRecord, grecord gandi.ZoneRecord) bool {
+	if strings.TrimSuffix(precord.RrsetValues[0], ".") == strings.TrimSuffix(grecord.RrsetValues[0], ".") && strings.ToLower(precord.RrsetName) == strings.ToLower(grecord.RrsetName) && precord.RrsetTTL-120 < grecord.RrsetTTL && precord.RrsetTTL+120 > grecord.RrsetTTL && strings.ToLower(precord.RrsetType) == strings.ToLower(grecord.RrsetType) {
+		return true
+	}
 	return false
 }
 
@@ -32,7 +36,7 @@ func compareAllRecords(protosRecords []gandi.ZoneRecord, gandiRecords []gandi.Zo
 	var matchCount = 0
 	for _, precord := range protosRecords {
 		for _, grecord := range gandiRecords {
-			if strings.TrimSuffix(precord.RrsetValues[0], ".") == strings.TrimSuffix(grecord.RrsetValues[0], ".") && strings.ToLower(precord.RrsetName) == strings.ToLower(grecord.RrsetName) && precord.RrsetTTL-120 < grecord.RrsetTTL && precord.RrsetTTL+120 > grecord.RrsetTTL && strings.ToLower(precord.RrsetType) == strings.ToLower(grecord.RrsetType) {
+			if compareRecords(precord, grecord) {
 				matchCount++
 			}
 		}
@@ -41,6 +45,20 @@ func compareAllRecords(protosRecords []gandi.ZoneRecord, gandiRecords []gandi.Zo
 		return false
 	}
 	return true
+}
+
+func setRecord(rscID string, domain string, record *resource.DNSResource) error {
+	_, err := gclient.CreateDomainRecord(domain, record.Host, record.Type, record.TTL, []string{record.Value})
+	if err != nil {
+		return errors.Wrapf(err, "Failed to update record %s(%s) in Gandi", record.Host, record.Type)
+	}
+	log.Debugf("Record %s(%s) has been updated", record.Host, record.Type)
+	err = pclient.SetResourceStatus(rscID, "created")
+	if err != nil {
+		log.Errorf("Failed to set status for resource %s: %s", rscID, err.Error())
+		return errors.Wrapf(err, "Failed to set status for resource %s", rscID)
+	}
+	return nil
 }
 
 //
@@ -53,18 +71,65 @@ func checkDNSResource(args ...interface{}) {
 		log.Errorf("Cannot handle new message. Wrong number of arguments: %d", len(args))
 		return
 	}
-	dnsrsc, ok := args[1].(resource.Resource)
+	dnsrsc, ok := args[0].(*resource.Resource)
 	if ok != true {
 		log.Error("Payload is not a Protos resource")
 		return
 	}
 
-	dnsvalue, ok := dnsrsc.Value.(*resource.DNSResource)
+	precord, ok := dnsrsc.Value.(*resource.DNSResource)
 	if ok != true {
 		log.Error("Resource is not of type DNS")
 		return
 	}
-	log.Info(dnsvalue)
+
+	if precord.Type == "MX" {
+		precord.Value = "10 " + precord.Value
+	}
+
+	if precord.Host == "@" {
+		precord.Host = domain
+	}
+
+	ip := net.ParseIP(precord.Value)
+	if ip != nil {
+		log.Infof("%s is an IP address", ip.String())
+	}
+
+	log.Infof("Checking record %s(%s)", precord.Host, precord.Type)
+	grecord, err := gclient.GetDomainRecordWithNameAndType(domain, precord.Host, precord.Type)
+	if err != nil {
+		if strings.Contains(err.Error(), "Can't find the DNS record") {
+			// Could not find record. Creating it.s
+			log.Infof("Could not find record %s(%s). Creating it", precord.Host, precord.Type)
+			err = setRecord(dnsrsc.ID, domain, precord)
+			if err != nil {
+				log.Error(err)
+				return
+			}
+
+		}
+		// Different error, just print it
+		log.Error("Failed to retrieve record from Gandi: ", err)
+		return
+
+	}
+
+	// Recound found. Compare and modify it if different
+	log.Debugf("Found record %s(%s). Checking for differences", grecord.RrsetName, grecord.RrsetType)
+	protosRecord := gandi.ZoneRecord{RrsetName: precord.Host, RrsetType: precord.Type, RrsetTTL: precord.TTL, RrsetValues: []string{precord.Value}}
+	if compareRecords(protosRecord, grecord) {
+		return
+	}
+
+	log.Infof("DNS resource %s (%s %s) is not in sync with the Gandi. Synchronizing.", dnsrsc.ID, precord.Type, precord.Host)
+	err = setRecord(dnsrsc.ID, domain, precord)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+	log.Debugf("DNS resource %s (%s %s) has been updated", dnsrsc.ID, precord.Type, precord.Host)
+
 }
 
 // periodicCheckAllResources is a handler that gets called periodically by the event loop.
@@ -79,28 +144,32 @@ func checkAllResources(args ...interface{}) {
 		return
 	}
 
-	protosRecords := []gandi.ZoneRecord{}
 	for _, rsc := range resources {
-		var record *resource.DNSResource
-		record = rsc.Value.(*resource.DNSResource)
-		protosRecord := gandi.ZoneRecord{RrsetName: record.Host, RrsetType: record.Type, RrsetTTL: record.TTL, RrsetValues: []string{record.Value}}
-		protosRecords = append(protosRecords, protosRecord)
+		checkDNSResource(rsc)
 	}
 
-	// Retrieving all Gandi DNS records
-	gandiRecords, err := gclient.ListDomainRecords(domain)
-	if err != nil {
-		log.Error("Could not retrieve all DNS records from Gandi: ", err.Error())
-	}
+	// protosRecords := []gandi.ZoneRecord{}
+	// for _, rsc := range resources {
+	// 	var record *resource.DNSResource
+	// 	record = rsc.Value.(*resource.DNSResource)
+	// 	protosRecord := gandi.ZoneRecord{RrsetName: record.Host, RrsetType: record.Type, RrsetTTL: record.TTL, RrsetValues: []string{record.Value}}
+	// 	protosRecords = append(protosRecords, protosRecord)
+	// }
 
-	equal := compareAllRecords(protosRecords, gandiRecords)
-	if equal {
-		log.Info("Records are the same. Nothing to do")
-		return
-	}
+	// // Retrieving all Gandi DNS records
+	// gandiRecords, err := gclient.ListDomainRecords(domain)
+	// if err != nil {
+	// 	log.Error("Could not retrieve all DNS records from Gandi: ", err.Error())
+	// }
 
-	log.Info("Records are NOT the same. Synchonizing")
-	return
+	// equal := compareAllRecords(protosRecords, gandiRecords)
+	// if equal {
+	// 	log.Info("Records are the same. Nothing to do")
+	// 	return
+	// }
+
+	// log.Info("Records are NOT the same. Synchonizing")
+	// return
 }
 
 func terminateHandler(args ...interface{}) {
@@ -158,6 +227,8 @@ func start(apikey string, timerInterval int64) {
 		terminateHandler()
 		log.Fatalf("Failed to start gandi-dns provider: %s", err.Error())
 	}
+
+	log.SetLevel(logrus.DebugLevel)
 
 	gclient = gandi.New(apikey, "")
 	pclient = protos.NewClient(protosHost, appID)
