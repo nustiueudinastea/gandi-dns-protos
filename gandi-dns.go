@@ -18,16 +18,34 @@ var domain string
 var pclient protos.Protos
 var gclient *gandi.Gandi
 
+type record struct {
+	dns    gandi.ZoneRecord
+	action string
+}
+
 //
 // Gandi methods
 //
 
-func dnsToString(dnsrsc *resource.DNSResource) string {
+func pdnsToString(dnsrsc *resource.DNSResource) string {
 	return fmt.Sprintf("{\"%s\" %s %d \"%s\"}", dnsrsc.Host, dnsrsc.Type, dnsrsc.TTL, dnsrsc.Value)
 }
 
-func convertToZoneRecord(record resource.DNSResource) gandi.ZoneRecord {
-	return gandi.ZoneRecord{RrsetType: record.Type, RrsetName: record.Host, RrsetTTL: record.TTL, RrsetValues: []string{record.Value}}
+func gdnsToString(record gandi.ZoneRecord) string {
+	return fmt.Sprintf("{\"%s\" %s %d \"%s\"}", record.RrsetName, record.RrsetType, record.RrsetTTL, record.RrsetValues)
+}
+
+func convertToZoneRecord(rscID string, record resource.DNSResource) gandi.ZoneRecord {
+	// ToDo: improve this. For now adding a default priority of 10
+	if record.Type == "MX" {
+		record.Value = "10 " + record.Value
+	}
+
+	if record.Host == "@" {
+		record.Host = domain
+	}
+
+	return gandi.ZoneRecord{RrsetHref: rscID, RrsetType: record.Type, RrsetName: record.Host, RrsetTTL: record.TTL, RrsetValues: []string{record.Value}}
 }
 
 func compareRecords(precord gandi.ZoneRecord, grecord gandi.ZoneRecord) bool {
@@ -37,45 +55,72 @@ func compareRecords(precord gandi.ZoneRecord, grecord gandi.ZoneRecord) bool {
 	return false
 }
 
-func compareAllRecords(protosRecords []gandi.ZoneRecord, gandiRecords []gandi.ZoneRecord) bool {
-	if len(protosRecords) != len(gandiRecords) {
-		return false
-	}
-	var matchCount = 0
-	for _, precord := range protosRecords {
-		for _, grecord := range gandiRecords {
-			if compareRecords(precord, grecord) {
-				matchCount++
+func compareAllRecords(precords []gandi.ZoneRecord, grecords []gandi.ZoneRecord) map[string]record {
+	recordsToChange := map[string]record{}
+
+	for _, precord := range precords {
+		found := false
+		for _, grecord := range grecords {
+			if precord.RrsetName == grecord.RrsetName {
+				found = true
+				if compareRecords(precord, grecord) == false {
+					recordsToChange[precord.RrsetName] = record{dns: precord, action: "update"}
+				}
+				break
 			}
 		}
+
+		if found == false {
+			recordsToChange[precord.RrsetName] = record{dns: precord, action: "create"}
+		}
 	}
-	if len(protosRecords) != matchCount {
-		return false
+
+	for _, grecord := range grecords {
+		found := false
+		for _, precord := range precords {
+			if grecord.RrsetName == precord.RrsetName {
+				found = true
+				break
+			}
+		}
+
+		if found == false {
+			recordsToChange[grecord.RrsetName] = record{dns: grecord, action: "delete"}
+		}
 	}
-	return true
+
+	return recordsToChange
 }
 
-func setRecord(rscID string, domain string, record *resource.DNSResource, update bool) error {
+func setRecord(domain string, record gandi.ZoneRecord, update bool) error {
 	var err error
 	if update == false {
-		_, err = gclient.CreateDomainRecord(domain, record.Host, record.Type, record.TTL, []string{record.Value})
+		_, err = gclient.CreateDomainRecord(domain, record.RrsetName, record.RrsetType, record.RrsetTTL, record.RrsetValues)
 		if err != nil {
-			return errors.Wrapf(err, "Failed to update record %s(%s) in Gandi", record.Host, record.Type)
+			return errors.Wrapf(err, "Failed to update resource %s(%s) in Gandi", record.RrsetHref, gdnsToString(record))
 		}
-		log.Debugf("Record %s(%s) has been created", record.Host, record.Type)
+		log.Debugf("Resource %s(%s) has been created", record.RrsetHref, gdnsToString(record))
 	} else {
-		_, err = gclient.ChangeDomainRecords(domain, []gandi.ZoneRecord{convertToZoneRecord(*record)})
+		_, err = gclient.ChangeDomainRecords(domain, []gandi.ZoneRecord{record})
 		if err != nil {
-			return errors.Wrapf(err, "Failed to update record %s(%s) in Gandi", record.Host, record.Type)
+			return errors.Wrapf(err, "Failed to update resource %s(%s) in Gandi", record.RrsetHref, gdnsToString(record))
 		}
-		log.Debugf("Record %s(%s) has been updated", record.Host, record.Type)
+		log.Debugf("Record %s(%s) has been updated", record.RrsetHref, gdnsToString(record))
 	}
 
-	err = pclient.SetResourceStatus(rscID, "created")
+	err = pclient.SetResourceStatus(record.RrsetHref, "created")
 	if err != nil {
-		log.Errorf("Failed to set status for resource %s: %s", rscID, err.Error())
-		return errors.Wrapf(err, "Failed to set status for resource %s", rscID)
+		return errors.Wrapf(err, "Failed to set status for resource %s", record.RrsetHref)
 	}
+	return nil
+}
+
+func deleteRecord(domain string, record gandi.ZoneRecord) error {
+	err := gclient.DeleteDomainRecord(domain, record.RrsetName, record.RrsetType)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to delete resource %s(%s) in Gandi", record.RrsetHref, gdnsToString(record))
+	}
+	log.Debugf("Record %s(%s) has been deleted", record.RrsetHref, gdnsToString(record))
 	return nil
 }
 
@@ -101,22 +146,15 @@ func checkDNSResource(args ...interface{}) {
 		return
 	}
 
-	// ToDo: improve this. For now adding a default priority of 10
-	if precord.Type == "MX" {
-		precord.Value = "10 " + precord.Value
-	}
+	protosRecord := convertToZoneRecord(dnsrsc.ID, *precord)
 
-	if precord.Host == "@" {
-		precord.Host = domain
-	}
-
-	log.Debugf("Checking dns resource %s %s", dnsrsc.ID, dnsToString(precord))
-	grecord, err := gclient.GetDomainRecordWithNameAndType(domain, precord.Host, precord.Type)
+	log.Debugf("Checking dns resource %s(%s)", dnsrsc.ID, gdnsToString(protosRecord))
+	grecord, err := gclient.GetDomainRecordWithNameAndType(domain, protosRecord.RrsetName, protosRecord.RrsetType)
 	if err != nil {
 		if strings.Contains(err.Error(), "Can't find the DNS record") {
 			// Could not find record. Creating it.s
-			log.Infof("Could not find DNS resource %s (%s) in Gandi. Creating it", dnsrsc.ID, dnsToString(precord))
-			err = setRecord(dnsrsc.ID, domain, precord, false)
+			log.Infof("Could not find DNS resource %s (%s) in Gandi. Creating it", dnsrsc.ID, gdnsToString(protosRecord))
+			err = setRecord(domain, protosRecord, false)
 			if err != nil {
 				log.Error(err)
 				return
@@ -130,18 +168,17 @@ func checkDNSResource(args ...interface{}) {
 	}
 
 	// Recound found. Compare and modify it if different
-	protosRecord := gandi.ZoneRecord{RrsetName: precord.Host, RrsetType: precord.Type, RrsetTTL: precord.TTL, RrsetValues: []string{precord.Value}}
 	if compareRecords(protosRecord, grecord) {
 		return
 	}
 
-	log.Infof("DNS resource %s (%s) is not in sync with Gandi. Updating it", dnsrsc.ID, dnsToString(precord))
-	err = setRecord(dnsrsc.ID, domain, precord, true)
+	log.Infof("DNS resource %s (%s) is not in sync with Gandi. Updating it", dnsrsc.ID, gdnsToString(protosRecord))
+	err = setRecord(domain, protosRecord, true)
 	if err != nil {
 		log.Error(err)
 		return
 	}
-	log.Debugf("DNS resource %s (%s) has been updated", dnsrsc.ID, dnsToString(precord))
+	log.Debugf("DNS resource %s (%s) has been updated", dnsrsc.ID, gdnsToString(protosRecord))
 
 }
 
@@ -157,32 +194,38 @@ func checkAllResources(args ...interface{}) {
 		return
 	}
 
+	protosRecords := []gandi.ZoneRecord{}
 	for _, rsc := range resources {
-		checkDNSResource(rsc)
+		var record *resource.DNSResource
+		record = rsc.Value.(*resource.DNSResource)
+		protosRecord := convertToZoneRecord(rsc.ID, *record)
+		protosRecords = append(protosRecords, protosRecord)
 	}
 
-	// protosRecords := []gandi.ZoneRecord{}
-	// for _, rsc := range resources {
-	// 	var record *resource.DNSResource
-	// 	record = rsc.Value.(*resource.DNSResource)
-	// 	protosRecord := gandi.ZoneRecord{RrsetName: record.Host, RrsetType: record.Type, RrsetTTL: record.TTL, RrsetValues: []string{record.Value}}
-	// 	protosRecords = append(protosRecords, protosRecord)
-	// }
+	// Retrieving all Gandi DNS records
+	gandiRecords, err := gclient.ListDomainRecords(domain)
+	if err != nil {
+		log.Error("Could not retrieve DNS records from Gandi: ", err.Error())
+	}
 
-	// // Retrieving all Gandi DNS records
-	// gandiRecords, err := gclient.ListDomainRecords(domain)
-	// if err != nil {
-	// 	log.Error("Could not retrieve all DNS records from Gandi: ", err.Error())
-	// }
+	recordsToChange := compareAllRecords(protosRecords, gandiRecords)
 
-	// equal := compareAllRecords(protosRecords, gandiRecords)
-	// if equal {
-	// 	log.Info("Records are the same. Nothing to do")
-	// 	return
-	// }
+	for _, record := range recordsToChange {
+		var err error
+		if record.action == "create" {
+			err = setRecord(domain, record.dns, false)
+		} else if record.action == "update" {
+			err = setRecord(domain, record.dns, true)
+		} else if record.action == "delete" {
+			err = deleteRecord(domain, record.dns)
+		} else {
+			log.Fatalf("Action %s not recognized for resource %s", record.action, record.dns.RrsetHref)
+		}
+		if err != nil {
+			log.Error(err)
+		}
+	}
 
-	// log.Info("Records are NOT the same. Synchonizing")
-	// return
 }
 
 func terminateHandler(args ...interface{}) {
